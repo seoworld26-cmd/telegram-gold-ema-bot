@@ -7,7 +7,7 @@ import yfinance as yf
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-SYMBOL = os.getenv("SYMBOL", "GC=F")   # Gold futures on Yahoo Finance
+SYMBOL = os.getenv("SYMBOL", "GC=F")
 INTERVAL = os.getenv("INTERVAL", "15m")
 FAST_EMA = int(os.getenv("FAST_EMA", "9"))
 SLOW_EMA = int(os.getenv("SLOW_EMA", "21"))
@@ -44,7 +44,6 @@ def save_last_signal(signal: str):
 
 
 def get_gold_data():
-    # Pull about 5 days of 15-minute candles
     df = yf.download(
         tickers=SYMBOL,
         period="5d",
@@ -56,7 +55,6 @@ def get_gold_data():
     if df is None or df.empty:
         return None
 
-    # Some yfinance returns multi-index columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] for col in df.columns]
 
