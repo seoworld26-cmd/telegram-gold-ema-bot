@@ -24,10 +24,7 @@ if not CHAT_ID:
 
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text
-    }
+    payload = {"chat_id": CHAT_ID, "text": text}
     r = requests.post(url, data=payload, timeout=20)
     r.raise_for_status()
 
@@ -56,6 +53,7 @@ def get_gold_data():
         )
 
         if df is None or df.empty:
+            print("No data returned from Yahoo.")
             return None
 
         if isinstance(df.columns, pd.MultiIndex):
@@ -64,7 +62,11 @@ def get_gold_data():
         return df
 
     except Exception as e:
-        print("Download error:", str(e))
+        err = str(e)
+        if "Too Many Requests" in err or "Rate limited" in err:
+            print("Yahoo rate limit hit. Waiting longer before retry...")
+        else:
+            print("Download error:", err)
         return None
 
 
@@ -76,7 +78,7 @@ def detect_signal(df: pd.DataFrame):
     df["ema_fast"] = close.ewm(span=FAST_EMA, adjust=False).mean()
     df["ema_slow"] = close.ewm(span=SLOW_EMA, adjust=False).mean()
 
-    # use last CLOSED candle and previous candle
+    # Use last CLOSED candle
     prev_fast = df["ema_fast"].iloc[-3]
     prev_slow = df["ema_slow"].iloc[-3]
     curr_fast = df["ema_fast"].iloc[-2]
@@ -93,7 +95,7 @@ def detect_signal(df: pd.DataFrame):
         )
         return signal, candle_time
 
-    elif prev_fast >= prev_slow and curr_fast < curr_slow:
+    if prev_fast >= prev_slow and curr_fast < curr_slow:
         signal = (
             f"GOLD SELL SIGNAL\n"
             f"EMA {FAST_EMA} crossed below EMA {SLOW_EMA}\n"
@@ -106,26 +108,25 @@ def detect_signal(df: pd.DataFrame):
 
 
 def main():
-    print("Bot started...")
+    print("Bot started and monitoring EMA crossover...")
 
     while True:
         try:
             df = get_gold_data()
 
             if df is None:
-                print("No data returned. Waiting before retry...")
                 time.sleep(CHECK_SECONDS)
                 continue
 
             signal, candle_time = detect_signal(df)
 
-            last_sent_signal = read_file(STATE_FILE)
-            last_candle_time = read_file(LAST_CANDLE_FILE)
+            last_signal = read_file(STATE_FILE)
+            last_candle = read_file(LAST_CANDLE_FILE)
 
-            if candle_time and candle_time != last_candle_time:
+            if candle_time and candle_time != last_candle:
                 write_file(LAST_CANDLE_FILE, candle_time)
 
-                if signal and signal != last_sent_signal:
+                if signal and signal != last_signal:
                     send_telegram_message(signal)
                     write_file(STATE_FILE, signal)
                     print("Signal sent:", signal)
@@ -142,4 +143,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# update
+    # update
