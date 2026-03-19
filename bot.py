@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 import pandas as pd
 import yfinance as yf
@@ -13,8 +14,7 @@ FAST_EMA = int(os.getenv("FAST_EMA", "9"))
 SLOW_EMA = int(os.getenv("SLOW_EMA", "21"))
 CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "900"))
 
-STATE_FILE = "last_signal.txt"
-LAST_CANDLE_FILE = "last_candle.txt"
+STATE_FILE = "signal_state.json"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is missing")
@@ -29,16 +29,24 @@ def send_telegram_message(text: str):
     r.raise_for_status()
 
 
-def read_file(path):
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"last_signal": None, "last_candle_time": None}
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_signal": None, "last_candle_time": None}
 
 
-def write_file(path, value):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(str(value))
+def save_state(signal_type, candle_time):
+    state = {
+        "last_signal": signal_type,
+        "last_candle_time": candle_time
+    }
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f)
 
 
 def get_gold_data():
@@ -64,47 +72,54 @@ def get_gold_data():
     except Exception as e:
         err = str(e)
         if "Too Many Requests" in err or "Rate limited" in err:
-            print("Yahoo rate limit hit. Waiting longer before retry...")
+            print("Yahoo rate limit hit. Waiting for next cycle...")
         else:
             print("Download error:", err)
         return None
 
 
-def detect_signal(df: pd.DataFrame):
+def detect_crossover(df: pd.DataFrame):
     if len(df) < SLOW_EMA + 3:
-        return None, None
+        return None
 
     close = df["Close"].copy()
     df["ema_fast"] = close.ewm(span=FAST_EMA, adjust=False).mean()
     df["ema_slow"] = close.ewm(span=SLOW_EMA, adjust=False).mean()
 
-    # Use last CLOSED candle
+    # Use only CLOSED candles
     prev_fast = df["ema_fast"].iloc[-3]
     prev_slow = df["ema_slow"].iloc[-3]
     curr_fast = df["ema_fast"].iloc[-2]
     curr_slow = df["ema_slow"].iloc[-2]
-    signal_price = df["Close"].iloc[-2]
+
+    signal_price = float(df["Close"].iloc[-2])
     candle_time = str(df.index[-2])
 
     if prev_fast <= prev_slow and curr_fast > curr_slow:
-        signal = (
-            f"GOLD BUY SIGNAL\n"
-            f"EMA {FAST_EMA} crossed above EMA {SLOW_EMA}\n"
-            f"Price: {signal_price}\n"
-            f"Time: {candle_time}"
-        )
-        return signal, candle_time
+        return {
+            "type": "BUY",
+            "price": signal_price,
+            "time": candle_time
+        }
 
     if prev_fast >= prev_slow and curr_fast < curr_slow:
-        signal = (
-            f"GOLD SELL SIGNAL\n"
-            f"EMA {FAST_EMA} crossed below EMA {SLOW_EMA}\n"
-            f"Price: {signal_price}\n"
-            f"Time: {candle_time}"
-        )
-        return signal, candle_time
+        return {
+            "type": "SELL",
+            "price": signal_price,
+            "time": candle_time
+        }
 
-    return None, candle_time
+    return None
+
+
+def build_message(signal):
+    return (
+        f"GOLD {signal['type']} SIGNAL\n"
+        f"EMA {FAST_EMA} crossed "
+        f"{'above' if signal['type']=='BUY' else 'below'} EMA {SLOW_EMA}\n"
+        f"Price: {signal['price']}\n"
+        f"Time: {signal['time']}"
+    )
 
 
 def main():
@@ -113,27 +128,32 @@ def main():
     while True:
         try:
             df = get_gold_data()
-
             if df is None:
                 time.sleep(CHECK_SECONDS)
                 continue
 
-            signal, candle_time = detect_signal(df)
+            signal = detect_crossover(df)
+            state = load_state()
 
-            last_signal = read_file(STATE_FILE)
-            last_candle = read_file(LAST_CANDLE_FILE)
+            if signal is None:
+                print("No new crossover signal.")
+                time.sleep(CHECK_SECONDS)
+                continue
 
-            if candle_time and candle_time != last_candle:
-                write_file(LAST_CANDLE_FILE, candle_time)
+            # Prevent duplicate alert for same signal candle
+            if (
+                state["last_signal"] == signal["type"]
+                and state["last_candle_time"] == signal["time"]
+            ):
+                print("Duplicate crossover already sent. Skipping.")
+                time.sleep(CHECK_SECONDS)
+                continue
 
-                if signal and signal != last_signal:
-                    send_telegram_message(signal)
-                    write_file(STATE_FILE, signal)
-                    print("Signal sent:", signal)
-                else:
-                    print("New candle checked. No crossover signal.")
-            else:
-                print("No new closed candle yet.")
+            message = build_message(signal)
+            send_telegram_message(message)
+            save_state(signal["type"], signal["time"])
+
+            print("Signal sent:", message)
 
         except Exception as e:
             print("Main loop error:", str(e))
