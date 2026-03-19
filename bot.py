@@ -11,9 +11,10 @@ SYMBOL = os.getenv("SYMBOL", "GC=F")
 INTERVAL = os.getenv("INTERVAL", "15m")
 FAST_EMA = int(os.getenv("FAST_EMA", "9"))
 SLOW_EMA = int(os.getenv("SLOW_EMA", "21"))
-CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "60"))
+CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "900"))
 
 STATE_FILE = "last_signal.txt"
+LAST_CANDLE_FILE = "last_candle.txt"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is missing")
@@ -31,78 +32,110 @@ def send_telegram_message(text: str):
     r.raise_for_status()
 
 
-def get_last_saved_signal():
-    if not os.path.exists(STATE_FILE):
+def read_file(path):
+    if not os.path.exists(path):
         return None
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return f.read().strip()
 
 
-def save_last_signal(signal: str):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        f.write(signal)
+def write_file(path, value):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(value))
 
 
 def get_gold_data():
-    df = yf.download(
-        tickers=SYMBOL,
-        period="5d",
-        interval=INTERVAL,
-        progress=False,
-        auto_adjust=False
-    )
+    try:
+        df = yf.download(
+            tickers=SYMBOL,
+            period="5d",
+            interval=INTERVAL,
+            progress=False,
+            auto_adjust=False,
+            threads=False
+        )
 
-    if df is None or df.empty:
+        if df is None or df.empty:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+
+        return df
+
+    except Exception as e:
+        print("Download error:", str(e))
         return None
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [col[0] for col in df.columns]
-
-    return df
 
 
 def detect_signal(df: pd.DataFrame):
     if len(df) < SLOW_EMA + 3:
-        return None
+        return None, None
 
     close = df["Close"].copy()
     df["ema_fast"] = close.ewm(span=FAST_EMA, adjust=False).mean()
     df["ema_slow"] = close.ewm(span=SLOW_EMA, adjust=False).mean()
 
-    prev_fast = df["ema_fast"].iloc[-2]
-    prev_slow = df["ema_slow"].iloc[-2]
-    curr_fast = df["ema_fast"].iloc[-1]
-    curr_slow = df["ema_slow"].iloc[-1]
-    last_close = df["Close"].iloc[-1]
+    # use last CLOSED candle and previous candle
+    prev_fast = df["ema_fast"].iloc[-3]
+    prev_slow = df["ema_slow"].iloc[-3]
+    curr_fast = df["ema_fast"].iloc[-2]
+    curr_slow = df["ema_slow"].iloc[-2]
+    signal_price = df["Close"].iloc[-2]
+    candle_time = str(df.index[-2])
 
     if prev_fast <= prev_slow and curr_fast > curr_slow:
-        return f"GOLD BUY SIGNAL\nEMA {FAST_EMA} crossed above EMA {SLOW_EMA}\nPrice: {last_close}"
-    elif prev_fast >= prev_slow and curr_fast < curr_slow:
-        return f"GOLD SELL SIGNAL\nEMA {FAST_EMA} crossed below EMA {SLOW_EMA}\nPrice: {last_close}"
+        signal = (
+            f"GOLD BUY SIGNAL\n"
+            f"EMA {FAST_EMA} crossed above EMA {SLOW_EMA}\n"
+            f"Price: {signal_price}\n"
+            f"Time: {candle_time}"
+        )
+        return signal, candle_time
 
-    return None
+    elif prev_fast >= prev_slow and curr_fast < curr_slow:
+        signal = (
+            f"GOLD SELL SIGNAL\n"
+            f"EMA {FAST_EMA} crossed below EMA {SLOW_EMA}\n"
+            f"Price: {signal_price}\n"
+            f"Time: {candle_time}"
+        )
+        return signal, candle_time
+
+    return None, candle_time
 
 
 def main():
     print("Bot started...")
+
     while True:
         try:
             df = get_gold_data()
-            if df is not None:
-                signal = detect_signal(df)
-                last_saved = get_last_saved_signal()
 
-                if signal and signal != last_saved:
+            if df is None:
+                print("No data returned. Waiting before retry...")
+                time.sleep(CHECK_SECONDS)
+                continue
+
+            signal, candle_time = detect_signal(df)
+
+            last_sent_signal = read_file(STATE_FILE)
+            last_candle_time = read_file(LAST_CANDLE_FILE)
+
+            if candle_time and candle_time != last_candle_time:
+                write_file(LAST_CANDLE_FILE, candle_time)
+
+                if signal and signal != last_sent_signal:
                     send_telegram_message(signal)
-                    save_last_signal(signal)
+                    write_file(STATE_FILE, signal)
                     print("Signal sent:", signal)
                 else:
-                    print("No new signal.")
+                    print("New candle checked. No crossover signal.")
             else:
-                print("No data returned.")
+                print("No new closed candle yet.")
 
         except Exception as e:
-            print("Error:", str(e))
+            print("Main loop error:", str(e))
 
         time.sleep(CHECK_SECONDS)
 
